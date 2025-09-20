@@ -151,4 +151,4 @@ Contributions are welcome! Please feel free to submit a Pull Request. For major 
 
 ## Contact
 
-For questions or collaborations, please contact [your-email@domain.com] or open an issue on GitHub.
+For questions or collaborations, please contact mrityunjay2603@gmail.com or open an issue on GitHub.
