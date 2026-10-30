@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -19,14 +19,17 @@ class CHMM:
     transition_weights: np.ndarray  # (n_states, n_states, n_features)
     emission_means: np.ndarray  # (n_states, n_features)
     emission_covs: np.ndarray  # (n_states, n_features, n_features)
+    _cholesky: tuple[np.ndarray, ...] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.n_states, int) or not isinstance(self.n_features, int):
+            raise ValueError("n_states and n_features must be integers")
         if self.n_states < 1 or self.n_features < 1:
             raise ValueError("n_states and n_features must be positive")
 
-        self.transition_weights = np.asarray(self.transition_weights, dtype=float)
-        self.emission_means = np.asarray(self.emission_means, dtype=float)
-        self.emission_covs = np.asarray(self.emission_covs, dtype=float)
+        self.transition_weights = np.array(self.transition_weights, dtype=float, copy=True)
+        self.emission_means = np.array(self.emission_means, dtype=float, copy=True)
+        self.emission_covs = np.array(self.emission_covs, dtype=float, copy=True)
 
         expected_shapes = (
             ("transition_weights", self.transition_weights, (self.n_states, self.n_states, self.n_features)),
@@ -45,11 +48,19 @@ class CHMM:
             self.emission_covs + np.swapaxes(self.emission_covs, 1, 2)
         )
         self.emission_covs = self.emission_covs + 1e-6 * np.eye(self.n_features)[None, :, :]
+        factors = []
         for covariance in self.emission_covs:
             try:
-                np.linalg.cholesky(covariance)
+                factors.append(np.linalg.cholesky(covariance))
             except np.linalg.LinAlgError as exc:
                 raise ValueError("emission covariances must be positive definite") from exc
+        self._cholesky = tuple(factors)
+
+        # Parameters are immutable after validation so cached factors stay valid.
+        for array in (self.transition_weights, self.emission_means, self.emission_covs):
+            array.setflags(write=False)
+        for factor in self._cholesky:
+            factor.setflags(write=False)
 
     def conditional_transition(self, features: np.ndarray) -> np.ndarray:
         """Return row-normalized transition probabilities for one feature vector."""
@@ -57,7 +68,10 @@ class CHMM:
         if features.shape != (self.n_features,) or not np.isfinite(features).all():
             raise ValueError(f"features must be a finite vector of length {self.n_features}")
 
-        logits = np.einsum("ijk,k->ij", self.transition_weights, features)
+        with np.errstate(over="ignore", invalid="ignore"):
+            logits = np.einsum("ijk,k->ij", self.transition_weights, features)
+        if not np.isfinite(logits).all():
+            raise ValueError("transition logits overflowed; rescale features or parameters")
         logits -= np.max(logits, axis=1, keepdims=True)
         exp_logits = np.exp(logits)
         return exp_logits / exp_logits.sum(axis=1, keepdims=True)
@@ -71,12 +85,15 @@ class CHMM:
         log_probs = np.empty(self.n_states, dtype=float)
         constant = self.n_features * np.log(2.0 * np.pi)
         for state in range(self.n_states):
-            covariance = self.emission_covs[state]
-            chol = np.linalg.cholesky(covariance)
+            chol = self._cholesky[state]
             diff = features - self.emission_means[state]
-            whitened = np.linalg.solve(chol, diff)
+            with np.errstate(over="ignore", invalid="ignore"):
+                whitened = np.linalg.solve(chol, diff)
+                quadratic = whitened @ whitened
             log_det = 2.0 * np.log(np.diag(chol)).sum()
-            log_probs[state] = -0.5 * (whitened @ whitened + log_det + constant)
+            log_probs[state] = -0.5 * (quadratic + log_det + constant)
+        if not np.isfinite(log_probs).all():
+            raise ValueError("emission likelihood overflowed; rescale features")
         return log_probs
 
     def viterbi(self, observations: np.ndarray) -> np.ndarray:
